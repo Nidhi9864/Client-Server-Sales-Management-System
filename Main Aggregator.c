@@ -1,159 +1,231 @@
-// parent.c - Head Office process that spawns branch child processes, communicates via FIFOs,
-// and polls their responses concurrently.
+/* main_aggregator.c
+   Usage: ./main_aggregator <MAIN_CSV> <BRANCH1_HOST> <BRANCH1_PORT> <BRANCH2_HOST> <BRANCH2_PORT>
+   Example: ./main_aggregator main.csv localhost 5001 localhost 5002
+*/
 
-#define _GNU_SOURCE
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
 #include <errno.h>
-#include <signal.h>
-#include <poll.h>
+#include <sys/file.h>
+#include <sys/time.h>
 #include <time.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
 
-#define MAX_BRANCHES 8
-#define MAX_NAME 64
-#define BUF 1024
+#define BUF_SZ 4096
+#define TIMEOUT_SEC 5
 
-typedef struct {
-    char name[MAX_NAME];
-    char fifo_parent_to_child[128];
-    char fifo_child_to_parent[128];
-    pid_t child_pid;
-    int fd_w; // write to child
-    int fd_r; // read from child
-} Branch;
-
-static void die(const char *msg) {
-    perror(msg);
-    exit(EXIT_FAILURE);
+ssize_t robust_send(int fd, const void *buf, size_t count) {
+    size_t sent = 0;
+    while (sent < count) {
+        ssize_t r = send(fd, (const char*)buf + sent, count - sent, 0);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        sent += r;
+    }
+    return sent;
 }
 
-static int mkfifo_if_needed(const char *path) {
-    if (mkfifo(path, 0666) == -1) {
-        if (errno == EEXIST) return 0;
-        return -1;
+ssize_t robust_recv(int fd, void *buf, size_t count) {
+    ssize_t r;
+    while (1) {
+        r = recv(fd, buf, count, 0);
+        if (r < 0 && errno == EINTR) continue;
+        return r;
     }
+}
+
+/* Connect to host:port -> returns socket fd or -1 */
+int connect_to(const char *host, const char *port) {
+    struct addrinfo hints, *res, *rp;
+    int sfd = -1;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET; // IPv4 for simplicity
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, port, &hints, &res) != 0) return -1;
+    for (rp = res; rp != NULL; rp = rp->ai_next) {
+        sfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (sfd < 0) continue;
+        if (connect(sfd, rp->ai_addr, rp->ai_addrlen) == 0) break;
+        close(sfd);
+        sfd = -1;
+    }
+    freeaddrinfo(res);
+    return sfd;
+}
+
+/* Parse branch reply text and extract values */
+int parse_reply(const char *reply, char *branch_id, size_t bid_len, int *records, double *subtotal) {
+    const char *p = strstr(reply, "BRANCH_ID:");
+    if (!p) return -1;
+    if (sscanf(p, "BRANCH_ID: %s", branch_id) != 1) return -1;
+    p = strstr(reply, "RECORDS:");
+    if (!p) return -1;
+    if (sscanf(p, "RECORDS: %d", records) != 1) return -1;
+    p = strstr(reply, "SUBTOTAL:");
+    if (!p) return -1;
+    if (sscanf(p, "SUBTOTAL: %lf", subtotal) != 1) return -1;
     return 0;
 }
 
-static void spawn_child(Branch *b) {
-    // Ensure FIFOs exist
-    if (mkfifo_if_needed(b->fifo_parent_to_child) == -1) die("mkfifo parent->child");
-    if (mkfifo_if_needed(b->fifo_child_to_parent) == -1) die("mkfifo child->parent");
+/* produce ISO8601 timestamp */
+void iso_time(char *buf, size_t n) {
+    time_t t = time(NULL);
+    struct tm tm;
+    gmtime_r(&t, &tm);
+    strftime(buf, n, "%Y-%m-%dT%H:%M:%SZ", &tm);
+}
 
-    pid_t pid = fork();
-    if (pid < 0) die("fork");
-    if (pid == 0) {
-        // Child: exec ./child <branchName> <p2c_fifo> <c2p_fifo> <data_dir>
-        char data_dir[128];
-        snprintf(data_dir, sizeof(data_dir), "data_%s", b->name);
-        execl("./child", "child", b->name, b->fifo_parent_to_child, b->fifo_child_to_parent, data_dir, (char*)NULL);
-        perror("execl child");
-        _exit(127);
+/* Atomically append an entry to main CSV: read-append-write via temp + rename, with flock for safety */
+int update_main_csv(const char *main_csv, const char *branch_id, int records, double subtotal) {
+    FILE *f = fopen(main_csv, "r");
+    if (!f) {
+        perror("fopen main csv");
+        return -1;
     }
-    b->child_pid = pid;
+    /* We will use flock on the file descriptor */
+    int fd = fileno(f);
+    if (flock(fd, LOCK_EX) != 0) {
+        perror("flock");
+        fclose(f);
+        return -1;
+    }
+    /* Read existing content to memory (small file expected) */
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *contents = malloc(size + 1);
+    if (!contents) { flock(fd, LOCK_UN); fclose(f); return -1; }
+    fread(contents, 1, size, f);
+    contents[size] = '\0';
 
-    // Parent opens FIFOs
-    b->fd_w = open(b->fifo_parent_to_child, O_WRONLY);
-    if (b->fd_w == -1) die("open write to child");
-    b->fd_r = open(b->fifo_child_to_parent, O_RDONLY | O_NONBLOCK);
-    if (b->fd_r == -1) die("open read from child");
-}
+    /* Create temp file */
+    char tmpname[512];
+    snprintf(tmpname, sizeof(tmpname), "%s.tmp", main_csv);
+    FILE *tf = fopen(tmpname, "w");
+    if (!tf) { perror("fopen tmp"); free(contents); flock(fd, LOCK_UN); fclose(f); return -1; }
 
-static void send_cmd(Branch *b, const char *cmd) {
-    dprintf(b->fd_w, "%s\n", cmd);
-}
+    /* write old content and append new line */
+    fputs(contents, tf);
+    free(contents);
 
-static void broadcast(Branch *branches, int n, const char *cmd) {
-    for (int i = 0; i < n; ++i) send_cmd(&branches[i], cmd);
-}
+    char timestr[64];
+    iso_time(timestr, sizeof(timestr));
+    fprintf(tf, "%s,%s,%d,%.2f,%s\n", timestr, branch_id, records, subtotal, timestr);
+    fflush(tf);
+    fsync(fileno(tf));
+    fclose(tf);
 
-static void close_branch(Branch *b) {
-    if (b->fd_w != -1) close(b->fd_w);
-    if (b->fd_r != -1) close(b->fd_r);
-    // FIFOs are left in workspace; Makefile clean removes them.
-}
-
-int main(int argc, char *argv[]) {
-    // Configure branches (can be edited or taken from argv in future)
-    int n = 3;
-    Branch branches[MAX_BRANCHES] = {0};
-    const char *defaults[] = {"Ahmedabad", "Surat", "Vadodara"};
-    for (int i = 0; i < n; ++i) {
-        snprintf(branches[i].name, sizeof(branches[i].name), "%s", defaults[i]);
-        snprintf(branches[i].fifo_parent_to_child, sizeof(branches[i].fifo_parent_to_child), "fifo_p2c_%s", defaults[i]);
-        snprintf(branches[i].fifo_child_to_parent, sizeof(branches[i].fifo_child_to_parent), "fifo_c2p_%s", defaults[i]);
-        branches[i].fd_r = branches[i].fd_w = -1;
+    /* rename atomically */
+    if (rename(tmpname, main_csv) != 0) {
+        perror("rename");
+        flock(fd, LOCK_UN);
+        fclose(f);
+        return -1;
     }
 
-    printf("[Company] Launching %d branches...\n", n);
-    for (int i = 0; i < n; ++i) spawn_child(&branches[i]);
+    flock(fd, LOCK_UN);
+    fclose(f);
+    return 0;
+}
 
-    // Initial handshake
-    for (int i = 0; i < n; ++i) send_cmd(&branches[i], "HELLO");
+int main(int argc, char **argv) {
+    if (argc != 6) {
+        fprintf(stderr, "Usage: %s <MAIN_CSV> <B1_HOST> <B1_PORT> <B2_HOST> <B2_PORT>\n", argv[0]);
+        return 1;
+    }
+    const char *main_csv = argv[1];
+    const char *b1_host = argv[2];
+    const char *b1_port = argv[3];
+    const char *b2_host = argv[4];
+    const char *b2_port = argv[5];
 
-    // Demo script of commands to show IPC + concurrency
-    // You can extend or make interactive later.
-    broadcast(branches, n, "GET_SUMMARY");
-    send_cmd(&branches[0], "RESTOCK shirts 10");
-    send_cmd(&branches[1], "SALE jeans 5");
-    send_cmd(&branches[2], "HIRE Anil Cashier");
-    send_cmd(&branches[0], "SALE shirts 3");
-    send_cmd(&branches[1], "RESTOCK jeans 7");
-    broadcast(branches, n, "GET_STOCK");
-    broadcast(branches, n, "GET_STAFF");
-    send_cmd(&branches[2], "SALE shirts 2");
-    send_cmd(&branches[2], "SALE jeans 1");
-    broadcast(branches, n, "GET_SALES");
-    broadcast(branches, n, "GET_SUMMARY");
+    int s1 = connect_to(b1_host, b1_port);
+    if (s1 < 0) { fprintf(stderr, "Could not connect to branch1 %s:%s\n", b1_host, b1_port); }
+    int s2 = connect_to(b2_host, b2_port);
+    if (s2 < 0) { fprintf(stderr, "Could not connect to branch2 %s:%s\n", b2_host, b2_port); }
 
-    // Poll loop to read responses for ~10 seconds
-    struct pollfd pfds[MAX_BRANCHES];
-    char buf[BUF];
-    time_t start = time(NULL);
-    while (time(NULL) - start < 10) {
-        int nfds = 0;
-        for (int i = 0; i < n; ++i) {
-            pfds[nfds].fd = branches[i].fd_r;
-            pfds[nfds].events = POLLIN;
-            nfds++;
+    if (s1 < 0 && s2 < 0) {
+        fprintf(stderr, "No branches available. Exiting.\n");
+        return 1;
+    }
+
+    /* Send REQUEST to connected branches */
+    const char *req = "REQUEST\n";
+    if (s1 >= 0) robust_send(s1, req, strlen(req));
+    if (s2 >= 0) robust_send(s2, req, strlen(req));
+
+    /* Use select to wait for both sockets with TIMEOUT_SEC timeout */
+    fd_set readfds;
+    int maxfd = (s1 > s2 ? s1 : s2);
+    char buf[BUF_SZ+1];
+    if (maxfd < 0) maxfd = 0;
+
+    struct timeval tv;
+    tv.tv_sec = TIMEOUT_SEC;
+    tv.tv_usec = 0;
+
+    int remaining = 0;
+    if (s1 >= 0) remaining++;
+    if (s2 >= 0) remaining++;
+
+    while (remaining > 0) {
+        FD_ZERO(&readfds);
+        if (s1 >= 0) FD_SET(s1, &readfds);
+        if (s2 >= 0) FD_SET(s2, &readfds);
+
+        struct timeval tv2 = tv; /* select may modify */
+        int rv = select(maxfd + 1, &readfds, NULL, NULL, &tv2);
+        if (rv < 0) {
+            if (errno == EINTR) continue;
+            perror("select");
+            break;
+        } else if (rv == 0) {
+            fprintf(stderr, "Timeout waiting for branches.\n");
+            break;
         }
-        int rv = poll(pfds, nfds, 500); // 0.5s
-        if (rv > 0) {
-            int idx = 0;
-            for (int i = 0; i < n; ++i) {
-                if (pfds[idx].revents & POLLIN) {
-                    ssize_t r = read(pfds[idx].fd, buf, sizeof(buf)-1);
-                    if (r > 0) {
-                        buf[r] = 0;
-                        // Print line by line with branch tag
-                        char *saveptr;
-                        char *line = strtok_r(buf, "\n", &saveptr);
-                        while (line) {
-                            printf("[%s -> Company] %s\n", branches[i].name, line);
-                            line = strtok_r(NULL, "\n", &saveptr);
-                        }
-                    }
+
+        for (int s = 0; s <= maxfd; ++s) {
+            if ((s == s1 || s == s2) && FD_ISSET(s, &readfds)) {
+                ssize_t r = robust_recv(s, buf, BUF_SZ);
+                if (r <= 0) {
+                    // connection closed or error
+                    close(s);
+                    if (s == s1) s1 = -1;
+                    if (s == s2) s2 = -1;
+                    remaining--;
+                    continue;
                 }
-                idx++;
+                buf[r] = '\0';
+                // we expect the branch to send full message in one shot (small)
+                char branch_id[64];
+                int records = 0;
+                double subtotal = 0.0;
+                if (parse_reply(buf, branch_id, sizeof(branch_id), &records, &subtotal) == 0) {
+                    printf("Received from %s: records=%d subtotal=%.2f\n", branch_id, records, subtotal);
+                    if (update_main_csv(main_csv, branch_id, records, subtotal) == 0) {
+                        printf("main CSV updated for branch %s\n", branch_id);
+                    } else {
+                        fprintf(stderr, "Failed to update main CSV for branch %s\n", branch_id);
+                    }
+                } else {
+                    fprintf(stderr, "Malformed reply from socket %d: [%s]\n", s, buf);
+                }
+                close(s);
+                if (s == s1) s1 = -1;
+                if (s == s2) s2 = -1;
+                remaining--;
             }
-        }
-    }
-
-    // Graceful shutdown
-    printf("[Company] Requesting graceful shutdown...\n");
-    broadcast(branches, n, "EXIT");
-
-    // Give children a moment to exit, then close resources
-    sleep(1);
-    for (int i = 0; i < n; ++i) {
-        close_branch(&branches[i]);
-        // Optionally wait on children (not strictly required since they are independent after IPC close)
-    }
-    printf("[Company] Done.\n");
+        } /* end for */
+    } /* end while */
+    printf("Aggregator finished.\n");
     return 0;
 }
